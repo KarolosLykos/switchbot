@@ -24,6 +24,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -61,7 +62,7 @@ func main() {
 	}
 	if *verbose {
 		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-		opts = append(opts, switchbot.WithLogger(logger), switchbot.WithScanHook(printOnce()))
+		opts = append(opts, switchbot.WithLogger(logger), switchbot.WithScanHook(printOnce(os.Stderr)))
 	}
 	client, err := switchbot.NewClient(opts...)
 	if err != nil {
@@ -84,8 +85,23 @@ func main() {
 	}
 }
 
+// bot is the part of *switchbot.Bot the commands use. Tests replace it.
+type bot interface {
+	Address() string
+	TurnOn(context.Context) error
+	TurnOff(context.Context) error
+	Press(context.Context) error
+	ArmDown(context.Context) error
+	ArmUp(context.Context) error
+	Status(context.Context) (switchbot.Status, error)
+	SetMode(context.Context, switchbot.Mode) error
+	SetInverted(context.Context, bool) error
+	SetHoldTime(context.Context, time.Duration) error
+}
+
 func run(client *switchbot.Client, scanTime time.Duration, args []string) error {
 	ctx := context.Background()
+	in := bufio.NewScanner(os.Stdin) // shared, so no input is lost between prompts
 
 	switch {
 	case len(args) == 0:
@@ -93,11 +109,11 @@ func run(client *switchbot.Client, scanTime time.Duration, args []string) error 
 		if err != nil {
 			return err
 		}
-		bot, err := choose(bots)
+		bot, err := choose(in, os.Stdout, bots)
 		if err != nil {
 			return err
 		}
-		return interactive(ctx, bot)
+		return interactive(ctx, in, os.Stdout, bot)
 	case args[0] == "scan":
 		bots, err := discover(ctx, client, scanTime)
 		for _, b := range bots {
@@ -111,9 +127,9 @@ func run(client *switchbot.Client, scanTime time.Duration, args []string) error 
 		return err
 	}
 	if len(args) == 1 {
-		return interactive(ctx, bot)
+		return interactive(ctx, in, os.Stdout, bot)
 	}
-	return command(ctx, bot, args[1:])
+	return command(ctx, os.Stdout, bot, args[1:])
 }
 
 func discover(ctx context.Context, client *switchbot.Client, scanTime time.Duration) ([]*switchbot.Bot, error) {
@@ -126,30 +142,31 @@ func discover(ctx context.Context, client *switchbot.Client, scanTime time.Durat
 	return bots, err
 }
 
-func choose(bots []*switchbot.Bot) (*switchbot.Bot, error) {
+// choose lists bots and reads which one the user wants.
+func choose[B fmt.Stringer](in *bufio.Scanner, out io.Writer, bots []B) (B, error) {
+	var none B
 	for i, b := range bots {
-		fmt.Printf("  [%d] %s\n", i+1, b)
+		fmt.Fprintf(out, "  [%d] %s\n", i+1, b)
 	}
 	if len(bots) == 1 {
 		return bots[0], nil
 	}
-	fmt.Print("Choose a Bot: ")
-	in := bufio.NewScanner(os.Stdin)
+	fmt.Fprint(out, "Choose a Bot: ")
 	if !in.Scan() {
-		return nil, errors.New("no Bot chosen")
+		return none, errors.New("no Bot chosen")
 	}
 	n, err := strconv.Atoi(strings.TrimSpace(in.Text()))
 	if err != nil || n < 1 || n > len(bots) {
-		return nil, errors.New("invalid choice")
+		return none, errors.New("invalid choice")
 	}
 	return bots[n-1], nil
 }
 
-func interactive(ctx context.Context, bot *switchbot.Bot) error {
-	fmt.Printf("\nControlling %s\n%s\n  q                  quit\n", bot.Address(), commandHelp)
-	in := bufio.NewScanner(os.Stdin)
+// interactive reads commands for bot until the input ends or the user quits.
+func interactive(ctx context.Context, in *bufio.Scanner, out io.Writer, bot bot) error {
+	fmt.Fprintf(out, "\nControlling %s\n%s\n  q                  quit\n", bot.Address(), commandHelp)
 	for {
-		fmt.Print("> ")
+		fmt.Fprint(out, "> ")
 		if !in.Scan() {
 			return nil
 		}
@@ -159,15 +176,15 @@ func interactive(ctx context.Context, bot *switchbot.Bot) error {
 		case args[0] == "q" || args[0] == "quit" || args[0] == "exit":
 			return nil
 		default:
-			if err := command(ctx, bot, args); err != nil {
-				fmt.Println("error:", err)
+			if err := command(ctx, out, bot, args); err != nil {
+				fmt.Fprintln(out, "error:", err)
 			}
 		}
 	}
 }
 
 // command runs one command on a Bot and prints the result.
-func command(ctx context.Context, bot *switchbot.Bot, args []string) error {
+func command(ctx context.Context, out io.Writer, bot bot, args []string) error {
 	arg := ""
 	if len(args) > 1 {
 		arg = args[1]
@@ -189,7 +206,7 @@ func command(ctx context.Context, bot *switchbot.Bot, args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("battery %d%%  firmware %s  mode %s  inverted %v  hold %s  timers %d\n",
+		fmt.Fprintf(out, "battery %d%%  firmware %s  mode %s  inverted %v  hold %s  timers %d\n",
 			st.Battery, st.Firmware, st.Mode, st.Inverted, st.HoldTime, st.Timers)
 		return nil
 	case "mode":
@@ -225,12 +242,13 @@ func command(ctx context.Context, bot *switchbot.Bot, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println("OK")
+	fmt.Fprintln(out, "OK")
 	return nil
 }
 
-// printOnce returns a scan hook that prints each distinct advertisement once.
-func printOnce() func(bluetooth.ScanResult) {
+// printOnce returns a scan hook that prints each distinct advertisement
+// once to w.
+func printOnce(w io.Writer) func(bluetooth.ScanResult) {
 	var (
 		mu      sync.Mutex
 		printed = map[string]bool{}
@@ -241,7 +259,7 @@ func printOnce() func(bluetooth.ScanResult) {
 		defer mu.Unlock()
 		if !printed[line] {
 			printed[line] = true
-			fmt.Fprintln(os.Stderr, "  seen:", line)
+			fmt.Fprintln(w, "  seen:", line)
 		}
 	}
 }

@@ -7,3 +7,8 @@ linters:
         # `defer client.Close()` is the idiomatic way to clean up; Close only
         # reports problems disconnecting, which callers usually can't act on.
         - (*github.com/karoloslykos/switchbot.Client).Close
+        # The command-line tool prints to the terminal; there is nothing to
+        # do if that fails.
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln

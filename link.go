@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +16,65 @@ import (
 // address alone (needed on macOS, and on Linux for devices BlueZ hasn't
 // seen yet).
 const findScanTime = 10 * time.Second
+
+// device is a connected GATT device. It is a bluetooth.Device except in
+// tests.
+type device interface {
+	// characteristics finds the characteristic requests are written to and
+	// the one responses are notified on.
+	characteristics() (write, notify characteristic, err error)
+	disconnect() error
+}
+
+// characteristic is the part of *bluetooth.DeviceCharacteristic the Client
+// uses.
+type characteristic interface {
+	WriteWithoutResponse(p []byte) (int, error)
+	EnableNotifications(callback func(buf []byte)) error
+}
+
+// btAdapter makes a *bluetooth.Adapter an adapter.
+type btAdapter struct{ *bluetooth.Adapter }
+
+func (a btAdapter) Connect(addr bluetooth.Address, params bluetooth.ConnectionParams) (device, error) {
+	dev, err := a.Adapter.Connect(addr, params)
+	if err != nil {
+		return nil, err
+	}
+	return btDevice{dev}, nil
+}
+
+// btDevice makes a bluetooth.Device a device.
+type btDevice struct{ dev bluetooth.Device }
+
+func (d btDevice) disconnect() error { return d.dev.Disconnect() }
+
+func (d btDevice) characteristics() (write, notify characteristic, err error) {
+	svcs, err := d.dev.DiscoverServices([]bluetooth.UUID{serviceUUID})
+	if err != nil {
+		return nil, nil, fmt.Errorf("discover services: %w", err)
+	}
+	if len(svcs) == 0 {
+		return nil, nil, ErrServiceNotFound
+	}
+	chars, err := svcs[0].DiscoverCharacteristics([]bluetooth.UUID{writeUUID, notifyUUID})
+	if err != nil {
+		return nil, nil, fmt.Errorf("discover characteristics: %w", err)
+	}
+	var w, n *bluetooth.DeviceCharacteristic
+	for i := range chars {
+		switch chars[i].UUID() {
+		case writeUUID:
+			w = &chars[i]
+		case notifyUUID:
+			n = &chars[i]
+		}
+	}
+	if w == nil || n == nil {
+		return nil, nil, fmt.Errorf("%w: characteristics missing", ErrServiceNotFound)
+	}
+	return w, n, nil
+}
 
 // link is an open connection to a device.
 type link interface {
@@ -32,8 +90,8 @@ type link interface {
 
 // gattLink is a link over a GATT connection.
 type gattLink struct {
-	dev  bluetooth.Device
-	char *bluetooth.DeviceCharacteristic
+	dev  device
+	char characteristic
 	in   chan []byte
 	lost chan struct{}
 	once sync.Once
@@ -55,7 +113,7 @@ func (l *gattLink) markLost()              { l.once.Do(func() { close(l.lost) })
 
 func (l *gattLink) close() error {
 	l.markLost()
-	return l.dev.Disconnect()
+	return l.dev.disconnect()
 }
 
 // gattDial connects to the device at addr and subscribes to its responses.
@@ -75,7 +133,7 @@ func (c *Client) gattDial(ctx context.Context, addr bluetooth.Address) (link, er
 	// Windows sometimes fails service discovery on a fresh connection; such
 	// errors are returned as they are, so the caller can retry. Only a
 	// device that really lacks the service gets ErrServiceNotFound.
-	write, notify, err := findCharacteristics(dev)
+	write, notify, err := dev.characteristics()
 	if err == nil {
 		err = notify.EnableNotifications(func(buf []byte) {
 			select {
@@ -99,8 +157,8 @@ func (c *Client) gattDial(ctx context.Context, addr bluetooth.Address) (link, er
 }
 
 // connect connects to addr, first directly and, if that fails, after
-// scanning for the device. c.mu must be held.
-func (c *Client) connect(ctx context.Context, addr bluetooth.Address) (bluetooth.Device, error) {
+// scanning for the device for c.findScan. c.mu must be held.
+func (c *Client) connect(ctx context.Context, addr bluetooth.Address) (device, error) {
 	log := c.log.With("address", addr.String())
 	params := func() bluetooth.ConnectionParams {
 		var p bluetooth.ConnectionParams
@@ -118,17 +176,15 @@ func (c *Client) connect(ctx context.Context, addr bluetooth.Address) (bluetooth
 		return dev, nil
 	}
 	if ctx.Err() != nil {
-		return bluetooth.Device{}, ctx.Err()
+		return nil, ctx.Err()
 	}
-	if runtime.GOOS == "windows" {
-		// Windows connects by address whether or not it has seen the
-		// device, so scanning first would not help.
-		return bluetooth.Device{}, fmt.Errorf("switchbot: connect to %s: %w", addr.String(), err)
+	if c.findScan <= 0 {
+		return nil, fmt.Errorf("switchbot: connect to %s: %w", addr.String(), err)
 	}
 
-	log.Debug("could not connect by address; scanning for the Bot", "err", err, "scanFor", findScanTime)
+	log.Debug("could not connect by address; scanning for the Bot", "err", err, "scanFor", c.findScan)
 	var found atomic.Bool
-	scanErr := c.scanLocked(ctx, findScanTime, func(s sighting) bool {
+	scanErr := c.scanLocked(ctx, c.findScan, func(s sighting) bool {
 		if strings.EqualFold(s.addr.String(), addr.String()) {
 			found.Store(true)
 			return false
@@ -136,17 +192,17 @@ func (c *Client) connect(ctx context.Context, addr bluetooth.Address) (bluetooth
 		return true
 	})
 	if scanErr != nil {
-		return bluetooth.Device{}, scanErr
+		return nil, scanErr
 	}
 	if !found.Load() {
-		return bluetooth.Device{}, fmt.Errorf("%w: %s (last connection error: %v)", ErrNotFound, addr.String(), err)
+		return nil, fmt.Errorf("%w: %s (last connection error: %v)", ErrNotFound, addr.String(), err)
 	}
 
 	log.Debug("Bot seen; connecting")
 	start = time.Now()
 	dev, err = c.adapter.Connect(addr, params())
 	if err != nil {
-		return bluetooth.Device{}, fmt.Errorf("switchbot: connect to %s: %w", addr.String(), err)
+		return nil, fmt.Errorf("switchbot: connect to %s: %w", addr.String(), err)
 	}
 	log.Debug("connected", "took", time.Since(start).Round(time.Millisecond))
 	return dev, nil
@@ -167,34 +223,6 @@ func (c *Client) onConnectionState(dev bluetooth.Device, state bluetooth.Connect
 		c.log.Debug("disconnected", "address", dev.Address.String(), "reason", state.Err)
 		l.markLost()
 	}
-}
-
-// findCharacteristics finds the characteristic requests are written to and
-// the one responses are notified on.
-func findCharacteristics(dev bluetooth.Device) (write, notify *bluetooth.DeviceCharacteristic, err error) {
-	svcs, err := dev.DiscoverServices([]bluetooth.UUID{serviceUUID})
-	if err != nil {
-		return nil, nil, fmt.Errorf("discover services: %w", err)
-	}
-	if len(svcs) == 0 {
-		return nil, nil, ErrServiceNotFound
-	}
-	chars, err := svcs[0].DiscoverCharacteristics([]bluetooth.UUID{writeUUID, notifyUUID})
-	if err != nil {
-		return nil, nil, fmt.Errorf("discover characteristics: %w", err)
-	}
-	for i := range chars {
-		switch chars[i].UUID() {
-		case writeUUID:
-			write = &chars[i]
-		case notifyUUID:
-			notify = &chars[i]
-		}
-	}
-	if write == nil || notify == nil {
-		return nil, nil, fmt.Errorf("%w: characteristics missing", ErrServiceNotFound)
-	}
-	return write, notify, nil
 }
 
 func addrKey(a bluetooth.Address) string { return strings.ToUpper(a.String()) }

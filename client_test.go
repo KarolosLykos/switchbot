@@ -17,7 +17,8 @@ import (
 // fakeAdapter replays a fixed list of advertisements, one every 5ms, until
 // StopScan is called. A new scan starts with a fresh stop channel.
 type fakeAdapter struct {
-	ads []bluetooth.ScanResult
+	ads     []bluetooth.ScanResult
+	connect func(bluetooth.Address, bluetooth.ConnectionParams) (device, error)
 
 	mu   sync.Mutex
 	stop chan struct{}
@@ -60,8 +61,11 @@ func (f *fakeAdapter) StopScan() error {
 	return nil
 }
 
-func (f *fakeAdapter) Connect(bluetooth.Address, bluetooth.ConnectionParams) (bluetooth.Device, error) {
-	return bluetooth.Device{}, errors.New("fake adapter cannot connect")
+func (f *fakeAdapter) Connect(addr bluetooth.Address, params bluetooth.ConnectionParams) (device, error) {
+	if f.connect == nil {
+		return nil, errors.New("fake adapter cannot connect")
+	}
+	return f.connect(addr, params)
 }
 
 // fakeAd is an advertisement payload.

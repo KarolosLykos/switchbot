@@ -129,3 +129,64 @@ func TestParseBasicInfo(t *testing.T) {
 		t.Errorf("password response: got %v, want ErrPasswordRequired", err)
 	}
 }
+
+func TestStatusErrorText(t *testing.T) {
+	tests := []struct {
+		code byte
+		want string
+	}{
+		{0x03, "switchbot: the Bot is busy (status 0x03)"},
+		{0x0b, "switchbot: no mesh device nearby (status 0x0B)"},
+		{0x7e, "switchbot: command failed with status 0x7E"},
+	}
+	for _, tt := range tests {
+		if got := (&StatusError{Code: tt.code}).Error(); got != tt.want {
+			t.Errorf("StatusError{0x%02X} = %q, want %q", tt.code, got, tt.want)
+		}
+	}
+}
+
+func TestModeString(t *testing.T) {
+	for m, want := range map[Mode]string{ModePress: "press", ModeSwitch: "switch", Mode(7): "Mode(7)"} {
+		if got := m.String(); got != want {
+			t.Errorf("Mode(%d).String() = %q, want %q", int(m), got, want)
+		}
+	}
+}
+
+func TestKindString(t *testing.T) {
+	for k, want := range map[kind]string{
+		kindBot:            "Bot",
+		kindOtherSwitchBot: "other SwitchBot device",
+		kindUnknown:        "SwitchBot device, type not advertised",
+		kindNotSwitchBot:   "not a SwitchBot device",
+	} {
+		if got := k.String(); got != want {
+			t.Errorf("kind(%d).String() = %q, want %q", int(k), got, want)
+		}
+	}
+}
+
+func TestCommandName(t *testing.T) {
+	tests := []struct {
+		req  []byte
+		want string
+	}{
+		{request(cmdAction, actionPress), "press"},
+		{request(cmdAction, actionOn), "turn on"},
+		{request(cmdAction, actionOff), "turn off"},
+		{request(cmdAction, actionArmDown), "arm down"},
+		{request(cmdAction, actionArmUp), "arm up"},
+		{request(cmdAction, 0x7f), "unknown"},
+		{request(cmdGetBasicInfo), "status"},
+		{request(cmdSetBasicInfo, 100, 0x10), "set mode"},
+		{request(cmdExtended, extSetHoldTime, 1), "set hold time"},
+		{request(cmdExtended, 0x01), "unknown"},
+		{[]byte{magic}, "unknown"},
+	}
+	for _, tt := range tests {
+		if got := commandName(tt.req); got != tt.want {
+			t.Errorf("commandName(% X) = %q, want %q", tt.req, got, tt.want)
+		}
+	}
+}

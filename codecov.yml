@@ -1,0 +1,3 @@
+# The example programs need a real Bot, so they can't be tested in CI.
+ignore:
+  - "examples/**"

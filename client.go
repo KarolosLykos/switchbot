@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,7 +19,7 @@ type adapter interface {
 	Enable() error
 	Scan(callback func(*bluetooth.Adapter, bluetooth.ScanResult)) error
 	StopScan() error
-	Connect(address bluetooth.Address, params bluetooth.ConnectionParams) (bluetooth.Device, error)
+	Connect(address bluetooth.Address, params bluetooth.ConnectionParams) (device, error)
 	SetConnectionStateHandler(func(bluetooth.Device, bluetooth.ConnectionState))
 }
 
@@ -35,6 +36,11 @@ type Client struct {
 	password    []byte
 	retries     int
 	idleTimeout time.Duration
+
+	// findScan is how long to scan for a Bot that can't be connected to by
+	// address. Zero means don't scan: Windows connects by address whether
+	// or not it has seen the device, so scanning wouldn't help.
+	findScan time.Duration
 
 	// dial opens a connection. It is c.gattDial except in tests.
 	dial func(ctx context.Context, addr bluetooth.Address) (link, error)
@@ -86,7 +92,7 @@ func WithRetries(n int) Option {
 // bluetooth.DefaultAdapter. The Client installs its own connection state
 // handler on it.
 func WithAdapter(adapter *bluetooth.Adapter) Option {
-	return func(c *Client) { c.adapter = adapter }
+	return func(c *Client) { c.adapter = btAdapter{adapter} }
 }
 
 // WithScanHook calls fn for every Bluetooth advertisement received while
@@ -100,7 +106,7 @@ func WithScanHook(fn func(bluetooth.ScanResult)) Option {
 // NewClient enables the Bluetooth adapter and returns a Client that uses it.
 // Call [Client.Close] when done, to disconnect from all Bots.
 func NewClient(opts ...Option) (*Client, error) {
-	c := newClient(bluetooth.DefaultAdapter, opts...)
+	c := newClient(btAdapter{bluetooth.DefaultAdapter}, opts...)
 	c.log.Debug("enabling Bluetooth adapter")
 	if err := c.adapter.Enable(); err != nil {
 		return nil, fmt.Errorf("switchbot: enable Bluetooth adapter: %w", err)
@@ -116,6 +122,9 @@ func newClient(a adapter, opts ...Option) *Client {
 		idleTimeout: time.Minute,
 		bots:        map[string]*Bot{},
 		links:       map[string]*gattLink{},
+	}
+	if runtime.GOOS != "windows" {
+		c.findScan = findScanTime
 	}
 	c.dial = c.gattDial
 	for _, opt := range opts {
