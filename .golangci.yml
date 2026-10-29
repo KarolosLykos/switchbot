@@ -1,0 +1,9 @@
+version: "2"
+
+linters:
+  settings:
+    errcheck:
+      exclude-functions:
+        # `defer client.Close()` is the idiomatic way to clean up; Close only
+        # reports problems disconnecting, which callers usually can't act on.
+        - (*github.com/karoloslykos/switchbot.Client).Close
