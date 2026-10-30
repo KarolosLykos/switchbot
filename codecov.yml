@@ -1,3 +1,16 @@
 # The example programs need a real Bot, so they can't be tested in CI.
 ignore:
   - "examples/**"
+
+coverage:
+  status:
+    # Overall coverage: fail only if it drops by more than 1%.
+    project:
+      default:
+        target: auto
+        threshold: 1%
+    # Coverage of the lines a change touches. Code that talks to real
+    # Bluetooth hardware can't be tested in CI, so this only reports.
+    patch:
+      default:
+        informational: true
